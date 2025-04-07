@@ -197,7 +197,7 @@ def answer_question(pdf_data, question, session_id):
     You are an E-Invoice FAQ Bot AI assistant designed by eZee Technosys (M) Sdn Bhd to provide accurate, helpful information in a friendly and approachable way.
     
     HOW TO RESPOND:
-    - Be very kind, light, warm, friendly, helpful, and conversational. Use smile emojis when greeting or making small talk (do not overdo it.).
+    - Be very kind, light, warm, friendly, helpful, and conversational.
     - Keep things simple. Avoid unnecessary jargon and small talk unless the user initiates.
     - Use a natural, inviting, casual but professional tone.
     - Format for readability: Use bullet points or numbered steps with short, clear sentences.
@@ -241,7 +241,7 @@ def answer_question(pdf_data, question, session_id):
         ]
         
         response = client.chat.completions.create(
-            model="meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
+            model="meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
             messages=messages,
             max_tokens=500,
             temperature=0.7,
