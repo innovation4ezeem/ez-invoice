@@ -4,8 +4,9 @@ import logging
 import traceback
 import re
 import hashlib
+import uuid 
 from functools import lru_cache
-from flask import Flask, request, jsonify, render_template, session
+from flask import Flask, request, jsonify, render_template
 from PyPDF2 import PdfReader
 from together import Together
 from google.oauth2.service_account import Credentials
@@ -15,7 +16,6 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 import redis
 import pytz
-import uuid
 
 # Configure logging
 logging.basicConfig(
@@ -29,10 +29,9 @@ logging.basicConfig(
 logger = logging.getLogger("ez-invoice-bot")
 
 app = Flask(__name__)
-app.secret_key = os.getenv("FLASK_SECRET_KEY", os.urandom(24).hex())  # For session management
 client = Together(api_key=os.getenv("TOGETHER_API_KEY"))
 
-# Configure Redis connection for rate limiting and conversation storage
+# Configure Redis connection for rate limiting
 redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 redis_client = redis.from_url(redis_url)
 
@@ -46,11 +45,8 @@ limiter = Limiter(
 )
 
 PDF_FOLDER = "pdfs"
-
-# Maximum history length to keep (number of exchanges)
-MAX_HISTORY_LENGTH = 10
-# Conversation expiry in seconds (24 hours)
-CONVERSATION_EXPIRY = 86400
+# Set conversation expiry time (30 minutes in seconds)
+CONVERSATION_EXPIRY = 1800
 
 # Track PDF content version for cache invalidation
 pdf_version = "1.0"
@@ -94,22 +90,23 @@ def load_all_pdfs(folder):
     
     return pdf_data
 
-def get_relevant_chunks(pdf_data, question, chat_history=None, chunk_size=1000, overlap=200):
-    """Find relevant chunks from PDF content based on keyword matching and chat history context."""
+def get_relevant_chunks(pdf_data, question, chat_history=""):
+    """Find relevant chunks from PDF content based on keyword matching."""
     all_chunks = []
     
-    # Combine current question with chat history for better context
-    combined_context = question
+    # Combine question with chat history for better context matching
+    combined_query = question
     if chat_history:
-        # Extract relevant keywords from recent history
-        history_text = " ".join([msg["content"] for msg in chat_history[-3:]])
-        combined_context = f"{history_text} {question}"
+        combined_query = question + " " + chat_history
     
-    # Extract potential keywords from the combined context
-    keywords = [word.lower() for word in re.findall(r'\b\w+\b', combined_context) 
+    # Extract potential keywords from the combined query
+    keywords = [word.lower() for word in re.findall(r'\b\w+\b', combined_query) 
                 if len(word) > 3 and word.lower() not in ['what', 'when', 'where', 'which', 'how', 'does', 'is', 'are', 'the', 'and', 'that']]
     
     # Create chunks with metadata
+    chunk_size = 1000
+    overlap = 200
+    
     for filename, content in pdf_data.items():
         if not content:
             continue
@@ -148,55 +145,69 @@ def format_response(response_text):
     
     return response_text.strip()
 
+# Redis-based conversation history management
 def get_conversation_history(session_id):
-    """Retrieve conversation history for a session from Redis."""
-    history_key = f"conversation:{session_id}"
-    history_json = redis_client.get(history_key)
-    
-    if history_json:
-        # Refresh expiry on access
-        redis_client.expire(history_key, CONVERSATION_EXPIRY)
-        return json.loads(history_json)
-    
-    return []
-
-def store_conversation_history(session_id, history):
-    """Store conversation history in Redis with expiry."""
-    history_key = f"conversation:{session_id}"
-    redis_client.set(history_key, json.dumps(history), ex=CONVERSATION_EXPIRY)
+    """Retrieves conversation history for a session from Redis."""
+    try:
+        history_data = redis_client.get(f"conv:{session_id}")
+        if history_data:
+            return json.loads(history_data)
+        return []
+    except Exception as e:
+        logger.error(f"Error retrieving conversation history: {e}")
+        return []
 
 def update_conversation_history(session_id, user_message, bot_response):
-    """Update the conversation history with new messages."""
-    history = get_conversation_history(session_id)
-    
-    # Add new messages to history
-    history.append({"role": "user", "content": user_message})
-    history.append({"role": "assistant", "content": bot_response})
-    
-    # Limit history length
-    if len(history) > MAX_HISTORY_LENGTH * 2:  # *2 because each exchange has 2 messages
-        history = history[-MAX_HISTORY_LENGTH * 2:]
-    
-    # Store updated history
-    store_conversation_history(session_id, history)
-    
-    return history
+    """Updates conversation history in Redis with new messages."""
+    try:
+        history = get_conversation_history(session_id)
+        
+        # Add new messages
+        history.append({"role": "user", "content": user_message})
+        history.append({"role": "assistant", "content": bot_response})
+        
+        # Limit history size (keep last 10 exchanges = 20 messages)
+        if len(history) > 20:
+            history = history[-20:]
+        
+        # Store updated history with expiry time
+        redis_client.setex(f"conv:{session_id}", CONVERSATION_EXPIRY, json.dumps(history))
+        return True
+    except Exception as e:
+        logger.error(f"Error updating conversation history: {e}")
+        return False
+
+@lru_cache(maxsize=100)
+def cached_answer(question, pdf_ver, session_id):
+    """Cached version of answer generation to avoid redundant API calls."""
+    logger.info(f"Cache miss for question: {question}, generating new response")
+    return answer_question(pdf_data, question, session_id)
 
 def answer_question(pdf_data, question, session_id):
     """Generates an AI response based on relevant PDF content, user query, and conversation history."""
     # Get conversation history
     chat_history = get_conversation_history(session_id)
     
+    # Format chat history for context
+    chat_history_text = ""
+    if chat_history:
+        recent_history = chat_history[-6:]  # Get last 3 exchanges (6 messages)
+        for msg in recent_history:
+            role_prefix = "Customer: " if msg["role"] == "user" else "Assistant: "
+            chat_history_text += f"{role_prefix}{msg['content']}\n"
+    
     # Get relevant text using both the question and chat history
-    relevant_text = get_relevant_chunks(pdf_data, question, chat_history)
+    relevant_text = get_relevant_chunks(pdf_data, question, chat_history_text)
     
     if not relevant_text.strip():
-        return "Sorry, I don't have enough information in my knowledge base to answer this question confidently. For more assistance on this, please contact our support team: support@ezeetechnosys.com.my."
+        return {
+            "answer": "Sorry, I don't have enough information in my knowledge base to answer this question confidently. For more assistance on this, please contact our support team: support@ezeetechnosys.com.my.",
+            "suggested_questions": []
+        }
 
     system_prompt = """
     You are an E-Invoice FAQ Bot AI assistant designed by eZee Technosys (M) Sdn Bhd to provide accurate, helpful information in a friendly and approachable way. 
-    You need to suggest 3 related question for user in order and you need to remember the order so that you can answer the question by user input the number of order
-
+    
     HOW TO RESPOND:
     - Be very kind, light, warm, friendly, helpful, and conversational.
     - Keep things simple. Avoid unnecessary jargon and small talk unless the user initiates.
@@ -207,7 +218,12 @@ def answer_question(pdf_data, question, session_id):
     - Don't state the reference of your information text. Do not mention specific sections or articles.
     - Do not mention a recap or summarise the user's context to the user. Avoid mentioning "So you're asking about...". Just answer the question.
     - Remember to maintain conversational context from previous messages when appropriate but no need to summarise the context to the user or repeat what the user is asking.
-    - suggest 3 relevant question for user in order and you need to remember the order so that you can answer the question by user input the number of order
+    
+    At the end of your response, include exactly THREE suggested follow-up questions in this JSON format:
+    
+    SUGGESTED_QUESTIONS: ["First question here?", "Second question here?", "Third question here?"]
+    
+    The questions should be clearly related to the current topic and helpful for continuing the conversation. Make them short and specific.
     """
 
     # Format any previous conversation as context
@@ -251,10 +267,40 @@ def answer_question(pdf_data, question, session_id):
         )
         
         response_text = response.choices[0].message.content.strip()
-        return format_response(response_text)
+        
+        # Extract suggested questions if present
+        suggested_questions = []
+        suggested_pattern = r"SUGGESTED_QUESTIONS:\s*\[(.*?)\]"
+        suggested_match = re.search(suggested_pattern, response_text, re.DOTALL)
+        
+        if suggested_match:
+            # Extract the content within brackets and parse it
+            questions_json = "[" + suggested_match.group(1) + "]"
+            try:
+                # Clean up the JSON string (replace single quotes with double quotes if needed)
+                questions_json = questions_json.replace("'", '"')
+                suggested_questions = json.loads(questions_json)
+                
+                # Remove the SUGGESTED_QUESTIONS section from the response
+                response_text = re.sub(suggested_pattern, "", response_text).strip()
+            except json.JSONDecodeError:
+                # If parsing fails, try to extract questions manually
+                possible_questions = re.findall(r'"(.*?)"', suggested_match.group(0))
+                if possible_questions:
+                    suggested_questions = possible_questions
+                # Remove the section from the response
+                response_text = re.sub(suggested_pattern, "", response_text).strip()
+        
+        return {
+            "answer": format_response(response_text),
+            "suggested_questions": suggested_questions
+        }
     except Exception as e:
         logger.error(f"Error generating response: {e}")
-        return "I'm sorry, I encountered an error while processing your request. Please try again in a moment."
+        return {
+            "answer": "I'm sorry, I encountered an error while processing your request. Please try again in a moment.",
+            "suggested_questions": []
+        }
 
 # --- GOOGLE DRIVE INTEGRATION ---
 def get_google_drive_service():
@@ -285,13 +331,13 @@ def append_to_google_sheet(data):
             logger.warning("GOOGLE_SHEET_ID not found in environment variables!")
             return False
             
-        range_name = "ChatLogs!A:E"  # Updated to include session ID and conversation number
-
+        range_name = "ChatLogs!A:E"  # Updated to include all 5 columns
+        
         malaysia_tz = pytz.timezone("Asia/Kuala_Lumpur")
         timestamp_myt = datetime.datetime.now(malaysia_tz).strftime("%Y-%m-%d %H:%M:%S")
-
-        # Added session ID and message count to the log
-        values = [[timestamp_myt, data[0][1], data[0][2], data[0][3], data[0][4]]]
+        
+        # Use the data directly without trying to access indexes that might not exist
+        values = data
         body = {"values": values}
 
         logger.debug(f"Sending data to Google Sheets: {body}")
@@ -310,7 +356,7 @@ def append_to_google_sheet(data):
     except Exception as e:
         logger.error(f"Error in append_to_google_sheet: {e}\n{traceback.format_exc()}")
         return False
-
+    
 # Pre-load PDF texts at server startup
 pdf_data = load_all_pdfs(PDF_FOLDER)
 
@@ -326,19 +372,25 @@ def handle_exception(e):
 @app.route("/", methods=["GET"])
 def home():
     """Render the main chat interface."""
-    # Generate session ID if not present
-    if 'session_id' not in session:
-        session['session_id'] = str(uuid.uuid4())
-    return render_template("index.html", session_id=session['session_id'])
+    # Generate a new session ID for new visitors
+    session_id = str(uuid.uuid4())
+    initialize_conversation(session_id)
+    return render_template("index.html", session_id=session_id)
 
 @app.route("/health", methods=["GET"])
 def health_check():
     """Simple endpoint to check if the service is running."""
+    try:
+        redis_connected = redis_client.ping()
+    except Exception as e:
+        logger.error(f"Redis connection error in health check: {e}")
+        redis_connected = False
+        
     return jsonify({
         "status": "ok", 
         "pdf_files": len(pdf_data),
         "version": pdf_version,
-        "redis_status": "connected" if redis_client.ping() else "disconnected"
+        "redis_status": "connected" if redis_connected else "disconnected"
     })
 
 @app.route("/chat", methods=["POST"])
@@ -353,6 +405,7 @@ def chat():
         session_id = data.get("session_id")
         if not session_id:
             session_id = str(uuid.uuid4())
+            initialize_conversation(session_id)
 
         if not user_message:
             return jsonify({"error": "No message provided"}), 400
@@ -365,9 +418,11 @@ def chat():
         msg_count = len(history) // 2 + 1  # Number of exchanges + 1
         
         # Generate response using conversation context
-        bot_response = answer_question(pdf_data, user_message, session_id)
+        response_data = answer_question(pdf_data, user_message, session_id)
+        bot_response = response_data["answer"]
+        suggested_questions = response_data["suggested_questions"]
         
-        # Update conversation history
+        # Update conversation history - store only the answer without suggested questions
         update_conversation_history(session_id, user_message, bot_response)
         
         # Log success
@@ -388,6 +443,7 @@ def chat():
 
         return jsonify({
             "response": bot_response, 
+            "suggested_questions": suggested_questions,
             "session_id": session_id
         })
         
@@ -395,18 +451,19 @@ def chat():
         logger.error(f"Error in chat endpoint: {str(e)}\n{traceback.format_exc()}")
         return jsonify({
             "response": "I'm sorry, I encountered an error while processing your request. Please try again in a moment.",
+            "suggested_questions": [],
             "session_id": session_id if 'session_id' in locals() else str(uuid.uuid4())
         }), 200  # Return 200 to client with error message to handle gracefully
-
+    
 @app.route("/new_conversation", methods=["POST"])
 def new_conversation():
-    """Creates a new conversation session."""
+    """Create a new conversation with a fresh session ID."""
     try:
-        # Generate new session ID
+        # Generate a new session ID
         new_session_id = str(uuid.uuid4())
         
-        # Update session variable if using Flask sessions
-        session['session_id'] = new_session_id
+        # Initialize empty conversation history for this session
+        initialize_conversation(new_session_id)
         
         logger.info(f"Created new conversation with session ID: {new_session_id}")
         
@@ -415,53 +472,22 @@ def new_conversation():
             "session_id": new_session_id
         })
     except Exception as e:
-        logger.error(f"Error creating new conversation: {e}")
+        logger.error(f"Error creating new conversation: {str(e)}\n{traceback.format_exc()}")
         return jsonify({
             "success": False,
-            "error": str(e)
+            "error": "Failed to create new conversation"
         }), 500
 
-@app.route("/reload", methods=["POST"])
-@limiter.exempt  # Exempt admin endpoints from rate limiting
-def reload_pdfs():
-    """Admin endpoint to reload PDFs when content changes."""
+# Helper function to initialize conversation history in Redis
+def initialize_conversation(session_id):
+    """Initialize an empty conversation history for a new session."""
     try:
-        auth_key = request.headers.get("X-Auth-Key")
-        expected_key = os.getenv("ADMIN_AUTH_KEY", "")
-        
-        if not auth_key or auth_key != expected_key:
-            logger.warning(f"Unauthorized reload attempt from {request.remote_addr}")
-            return jsonify({"error": "Unauthorized"}), 401
-            
-        global pdf_data, pdf_version
-        old_version = pdf_version
-        pdf_data = load_all_pdfs(PDF_FOLDER)
-        
-        return jsonify({
-            "success": True,
-            "message": f"PDFs reloaded successfully. Version changed from {old_version} to {pdf_version}",
-            "file_count": len(pdf_data)
-        })
-        
+        # Set expiry time for this conversation (30 minutes = 1800 seconds)
+        redis_client.setex(f"conv:{session_id}", CONVERSATION_EXPIRY, json.dumps([]))
+        return True
     except Exception as e:
-        logger.error(f"Error reloading PDFs: {e}")
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
+        logger.error(f"Error initializing conversation: {str(e)}")
+        return False
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    logger.info(f"Starting EZ-Invoice FAQ Bot on port {port}")
-    logger.info(f"Loaded {len(pdf_data)} PDF files from {PDF_FOLDER}")
-    
-    # Verify Redis connection at startup
-    try:
-        if redis_client.ping():
-            logger.info(f"Successfully connected to Redis at {redis_url}")
-        else:
-            logger.warning("Redis ping failed - rate limiting may not work correctly")
-    except Exception as e:
-        logger.error(f"Redis connection error: {e}")
-    
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)), debug=False)
